@@ -55,7 +55,7 @@ st.markdown(
     """
 Upload a catalogue containing:
 
-**Parent Group Id | Image Url 1 | Image Url 2 ... Image Url 8**
+**Parent ZSKU | Image Url 1 | Image Url 2 ... Image Url 8**
 
 Every image will be downloaded, validated and transformed to the
 platform image ratio **without cropping or stretching the original image**.
