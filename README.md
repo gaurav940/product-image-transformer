@@ -1,0 +1,1 @@
+A Streamlit-based tool for bulk validating and transforming product images from Excel sheets. Supports up to 8 images per parent SKU, Google Drive and direct image URLs, minimum resolution checks, aspect-ratio padding without cropping, live processing progress, and downloadable output reports.
