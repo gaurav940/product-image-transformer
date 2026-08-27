@@ -83,10 +83,35 @@ DEFAULT_SKU_COLUMN = "Parent Group Id"
 RESULT_SHEET_NAME = "Processing Results"
 
 
+
+def normalize_source_url(url):
+    """
+    Convert known share/view URLs into direct image-download URLs.
+    """
+
+    url = str(url).strip()
+
+    # Google Drive:
+    # https://drive.google.com/file/d/FILE_ID/view?usp=sharing
+    drive_match = re.search(
+        r"drive\.google\.com/file/d/([^/]+)",
+        url,
+    )
+
+    if drive_match:
+        file_id = drive_match.group(1)
+
+        return (
+            "https://drive.usercontent.google.com/"
+            f"download?id={file_id}&export=download"
+        )
+
+    return url
+
+
 # ============================================================
 # IMAGE NORMALIZATION
-# ============================================================
-
+# ===========================================================
 
 def normalize_image(img):
     """
@@ -642,7 +667,7 @@ def download_image(url):
     """
     Download image with retries, redirects and timeout handling.
     """
-
+    url = normalize_source_url(url)
     headers = {
         "User-Agent": (
             "Mozilla/5.0 "
