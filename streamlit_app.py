@@ -345,8 +345,9 @@ if (
                 status
             )
 
-        elif status.startswith(
-            "BLOCKED"
+        elif (
+            status.startswith("BLOCKED")
+            or status.startswith("SKIPPED")
         ):
 
             live_stats[

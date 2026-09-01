@@ -3,35 +3,42 @@
 """
 image_transformation.py
 
-Bulk product image transformation engine.
+Bulk product image transformation pipeline.
 
 Expected Excel format:
 
     Parent Group Id | Image Url 1 | Image Url 2 | ... | Image Url 8
 
-Rules:
+Processing rules:
 
-    Minimum Width  = 660 px
-    Minimum Height = 900 px
+1. Minimum image resolution:
+       Width  >= 660 px
+       Height >= 900 px
 
-    Target W:H = 660:900 = 0.733333...
-    Target H:W = 900:660 = 1.363636...
+2. If the product/foreground touches ANY image boundary:
+       DO NOT TRANSFORM
+       Status = SKIPPED_PRODUCT_TOUCHES_EDGE
 
-Behaviour:
+3. Otherwise:
+       Transform to target aspect ratio 660:900
+       WITHOUT cropping or stretching.
 
-    - Does NOT crop the source image.
-    - Does NOT stretch/distort the source image.
-    - Adds canvas where required.
-    - Canvas is generated from the image edge/background.
-    - Supports up to 8 images per Parent Group Id.
-    - Images below 660 x 900 are blocked.
-    - One failed image does NOT fail the entire SKU.
-    - Generates a "Processing Results" sheet.
-    - Supports a progress callback for Streamlit.
+4. Output filenames:
+       ParentSKU_1.jpg
+       ParentSKU_2.jpg
+       ...
+       ParentSKU_8.jpg
+
+Supports:
+    - Normal image URLs
+    - Google Drive share URLs
+    - Up to 8 images per Parent Group Id
+    - Excel processing report
+    - Streamlit progress callback
 
 Dependencies:
 
-    pip install pillow numpy requests openpyxl
+    python3 -m pip install pillow numpy requests openpyxl
 """
 
 import os
@@ -39,6 +46,7 @@ import re
 import sys
 import time
 import argparse
+
 from io import BytesIO
 from collections import Counter
 
@@ -46,13 +54,14 @@ import numpy as np
 import requests
 
 from PIL import Image, ImageFilter, ImageOps
+
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
 
 # ============================================================
-# PLATFORM CONFIGURATION
+# CONFIGURATION
 # ============================================================
 
 MIN_W = 660
@@ -66,10 +75,24 @@ TARGET_W_H_RATIO = MIN_W / MIN_H
 
 MAX_IMAGES_PER_SKU = 8
 
+DEFAULT_SKU_COLUMN = "Parent Group Id"
+
+RESULT_SHEET_NAME = "Processing Results"
+
+
+# ============================================================
+# PADDING CONFIGURATION
+# ============================================================
+
 EDGE_SAMPLE_PX = 6
 
 SEAM_BLUR_BAND = 14
 SEAM_BLUR_RADIUS = 6
+
+
+# ============================================================
+# DOWNLOAD CONFIGURATION
+# ============================================================
 
 MAX_DOWNLOAD_MB = 30
 
@@ -78,51 +101,36 @@ READ_TIMEOUT = 30
 
 DOWNLOAD_RETRIES = 3
 
-DEFAULT_SKU_COLUMN = "Parent Group Id"
 
-RESULT_SHEET_NAME = "Processing Results"
+# ============================================================
+# EDGE DETECTION CONFIGURATION
+# ============================================================
 
+# RGB distance from estimated background after which a pixel
+# is considered likely foreground/product.
+BACKGROUND_DISTANCE_THRESHOLD = 35
 
-
-def normalize_source_url(url):
-    """
-    Convert known share/view URLs into direct image-download URLs.
-    """
-
-    url = str(url).strip()
-
-    # Google Drive:
-    # https://drive.google.com/file/d/FILE_ID/view?usp=sharing
-    drive_match = re.search(
-        r"drive\.google\.com/file/d/([^/]+)",
-        url,
-    )
-
-    if drive_match:
-        file_id = drive_match.group(1)
-
-        return (
-            "https://drive.usercontent.google.com/"
-            f"download?id={file_id}&export=download"
-        )
-
-    return url
+# If more than 8% of ANY boundary differs from the background,
+# treat the product as touching that edge and SKIP transformation.
+EDGE_FOREGROUND_FRACTION_THRESHOLD = 0.08
 
 
 # ============================================================
 # IMAGE NORMALIZATION
-# ===========================================================
+# ============================================================
+
 
 def normalize_image(img):
     """
-    Apply EXIF orientation and convert the image to RGB.
+    Correct EXIF orientation and convert image to RGB.
 
-    Transparent images are placed on a white background.
+    Transparent images are placed onto a white background.
     """
 
     img = ImageOps.exif_transpose(img)
 
     if img.mode in ("RGBA", "LA"):
+
         rgba = img.convert("RGBA")
 
         background = Image.new(
@@ -131,12 +139,22 @@ def normalize_image(img):
             (255, 255, 255, 255),
         )
 
-        background.alpha_composite(rgba)
+        background.alpha_composite(
+            rgba
+        )
 
-        return background.convert("RGB")
+        return background.convert(
+            "RGB"
+        )
 
-    if img.mode == "P" and "transparency" in img.info:
-        rgba = img.convert("RGBA")
+    if (
+        img.mode == "P"
+        and "transparency" in img.info
+    ):
+
+        rgba = img.convert(
+            "RGBA"
+        )
 
         background = Image.new(
             "RGBA",
@@ -144,43 +162,293 @@ def normalize_image(img):
             (255, 255, 255, 255),
         )
 
-        background.alpha_composite(rgba)
+        background.alpha_composite(
+            rgba
+        )
 
-        return background.convert("RGB")
+        return background.convert(
+            "RGB"
+        )
 
-    return img.convert("RGB")
+    return img.convert(
+        "RGB"
+    )
 
 
 # ============================================================
-# BACKGROUND / NOISE GENERATION
+# BACKGROUND DETECTION
+# ============================================================
+
+
+def estimate_background_color(arr):
+    """
+    Estimate image background using the four image corners.
+
+    Rather than averaging all corners, choose the corner whose
+    median colour is most similar to the other corners.
+
+    This helps if the product touches one particular corner.
+    """
+
+    height, width, _ = arr.shape
+
+    patch_size = max(
+        12,
+        int(
+            min(
+                height,
+                width,
+            )
+            * 0.04
+        ),
+    )
+
+    patch_size = min(
+        patch_size,
+        100,
+    )
+
+    corners = [
+        arr[
+            :patch_size,
+            :patch_size,
+            :
+        ],
+        arr[
+            :patch_size,
+            -patch_size:,
+            :
+        ],
+        arr[
+            -patch_size:,
+            :patch_size,
+            :
+        ],
+        arr[
+            -patch_size:,
+            -patch_size:,
+            :
+        ],
+    ]
+
+    corner_colors = np.asarray(
+        [
+            np.median(
+                corner.reshape(
+                    -1,
+                    3,
+                ),
+                axis=0,
+            )
+            for corner in corners
+        ],
+        dtype=np.float32,
+    )
+
+    distances = np.linalg.norm(
+        corner_colors[:, None, :]
+        - corner_colors[None, :, :],
+        axis=2,
+    )
+
+    medoid_index = int(
+        np.argmin(
+            distances.sum(
+                axis=1
+            )
+        )
+    )
+
+    return corner_colors[
+        medoid_index
+    ]
+
+
+def get_edge_foreground_fraction(
+    edge_strip,
+    background_color,
+):
+    """
+    Estimate how much of an edge differs from the estimated
+    background colour.
+
+    Returns a value between 0 and 1.
+    """
+
+    distance = np.linalg.norm(
+        edge_strip.astype(
+            np.float32
+        )
+        - background_color.reshape(
+            1,
+            1,
+            3,
+        ),
+        axis=2,
+    )
+
+    foreground_mask = (
+        distance
+        > BACKGROUND_DISTANCE_THRESHOLD
+    )
+
+    return float(
+        foreground_mask.mean()
+    )
+
+
+def detect_product_touching_edges(img):
+    """
+    Detect whether product/foreground reaches any image boundary.
+
+    Checks:
+        TOP
+        BOTTOM
+        LEFT
+        RIGHT
+
+    Returns:
+
+        warnings
+        fractions
+
+    Example:
+
+        warnings = [
+            "PRODUCT_TOUCHES_BOTTOM_EDGE",
+            "PRODUCT_TOUCHES_RIGHT_EDGE"
+        ]
+
+        fractions = {
+            "TOP": 0.00,
+            "BOTTOM": 0.47,
+            "LEFT": 0.00,
+            "RIGHT": 0.28
+        }
+    """
+
+    img = normalize_image(
+        img
+    )
+
+    arr = np.asarray(
+        img,
+        dtype=np.float32,
+    )
+
+    height, width, _ = (
+        arr.shape
+    )
+
+    edge_size = min(
+        EDGE_SAMPLE_PX,
+        height,
+        width,
+    )
+
+    background_color = (
+        estimate_background_color(
+            arr
+        )
+    )
+
+    strips = {
+        "TOP": arr[
+            :edge_size,
+            :,
+            :
+        ],
+
+        "BOTTOM": arr[
+            -edge_size:,
+            :,
+            :
+        ],
+
+        "LEFT": arr[
+            :,
+            :edge_size,
+            :
+        ],
+
+        "RIGHT": arr[
+            :,
+            -edge_size:,
+            :
+        ],
+    }
+
+    fractions = {
+        name: get_edge_foreground_fraction(
+            strip,
+            background_color,
+        )
+        for name, strip
+        in strips.items()
+    }
+
+    warnings = [
+        f"PRODUCT_TOUCHES_{name}_EDGE"
+        for name, fraction
+        in fractions.items()
+        if (
+            fraction
+            > EDGE_FOREGROUND_FRACTION_THRESHOLD
+        )
+    ]
+
+    return (
+        warnings,
+        fractions,
+    )
+
+
+# ============================================================
+# PADDING HELPERS
 # ============================================================
 
 
 def estimate_local_noise(strip):
     """
-    Estimate local image grain/noise using adjacent pixel differences.
+    Estimate local image grain/noise.
     """
 
-    strip = strip.astype(np.float32)
+    strip = strip.astype(
+        np.float32
+    )
 
     differences = []
 
     if strip.shape[0] > 1:
+
         differences.append(
-            np.diff(strip, axis=0).ravel()
+            np.diff(
+                strip,
+                axis=0,
+            ).ravel()
         )
 
     if strip.shape[1] > 1:
+
         differences.append(
-            np.diff(strip, axis=1).ravel()
+            np.diff(
+                strip,
+                axis=1,
+            ).ravel()
         )
 
     if not differences:
+
         return 0.8
 
-    values = np.concatenate(differences)
+    values = np.concatenate(
+        differences
+    )
 
-    std = values.std() / np.sqrt(2)
+    std = (
+        values.std()
+        / np.sqrt(2)
+    )
 
     return float(
         np.clip(
@@ -197,16 +465,17 @@ def build_edge_fill(
     axis,
 ):
     """
-    Generate a padded area from the true image edge.
+    Extend clean image background outward.
 
     axis="v"
-        Top/bottom padding.
+        top / bottom
 
     axis="h"
-        Left/right padding.
+        left / right
     """
 
     if pad_size <= 0:
+
         raise ValueError(
             "pad_size must be greater than zero"
         )
@@ -248,10 +517,14 @@ def add_matched_noise(
     seed,
 ):
     """
-    Add subtle grain to the generated canvas.
+    Add subtle grain to generated padding.
     """
 
-    rng = np.random.default_rng(seed)
+    rng = (
+        np.random.default_rng(
+            seed
+        )
+    )
 
     noise = rng.normal(
         0,
@@ -259,20 +532,18 @@ def add_matched_noise(
         size=region.shape,
     )
 
-    output = (
-        region.astype(np.float32)
-        + noise
-    )
-
     return np.clip(
-        output,
+        region.astype(
+            np.float32
+        )
+        + noise,
         0,
         255,
     )
 
 
 # ============================================================
-# VALIDATION
+# RESOLUTION VALIDATION
 # ============================================================
 
 
@@ -281,14 +552,19 @@ def validate_resolution(
     height,
 ):
     """
-    Enforce minimum supported resolution.
+    Validate platform minimum resolution.
     """
 
-    if width < MIN_W or height < MIN_H:
+    if (
+        width < MIN_W
+        or height < MIN_H
+    ):
 
         raise ValueError(
-            f"Image {width}x{height} is below "
-            f"minimum supported resolution "
+            f"Image "
+            f"{width}x{height} "
+            f"is below minimum "
+            f"supported resolution "
             f"{MIN_W}x{MIN_H}"
         )
 
@@ -300,41 +576,60 @@ def validate_resolution(
 
 def pad_to_target_ratio(img):
     """
-    Pad image to H:W = 900:660.
+    Transform to target H:W = 900:660.
+
+    IMPORTANT:
+
+    This function should ONLY receive images that already passed
+    product-edge detection.
+
+    Therefore all boundaries are expected to contain background.
 
     No cropping.
     No stretching.
-    No distortion.
+    No product distortion.
 
     Returns:
 
-        output_image
+        transformed_image
         transformation_description
     """
 
-    img = normalize_image(img)
+    img = normalize_image(
+        img
+    )
 
-    width, height = img.size
+    width, height = (
+        img.size
+    )
 
     validate_resolution(
         width,
         height,
     )
 
-    current_ratio = height / width
+    current_ratio = (
+        height / width
+    )
 
     # --------------------------------------------------------
     # ALREADY AT TARGET
     # --------------------------------------------------------
 
-    if abs(current_ratio - TARGET_RATIO) < 0.001:
+    if (
+        abs(
+            current_ratio
+            - TARGET_RATIO
+        )
+        < 0.001
+    ):
 
         return (
             img,
             "NONE",
         )
 
-    arr = np.array(
+    arr = np.asarray(
         img,
         dtype=np.float32,
     )
@@ -342,8 +637,7 @@ def pad_to_target_ratio(img):
     # ========================================================
     # IMAGE TOO WIDE / SHORT
     #
-    # Need additional HEIGHT.
-    # Add top + bottom padding.
+    # Add TOP + BOTTOM
     # ========================================================
 
     if current_ratio < TARGET_RATIO:
@@ -351,19 +645,23 @@ def pad_to_target_ratio(img):
         new_width = width
 
         new_height = round(
-            width * TARGET_RATIO
+            width
+            * TARGET_RATIO
         )
 
         pad_total = (
-            new_height - height
+            new_height
+            - height
         )
 
         pad_top = (
-            pad_total // 2
+            pad_total
+            // 2
         )
 
         pad_bottom = (
-            pad_total - pad_top
+            pad_total
+            - pad_top
         )
 
         canvas = np.zeros(
@@ -375,9 +673,10 @@ def pad_to_target_ratio(img):
             dtype=np.float32,
         )
 
-        # Original image
+        # Original image remains untouched.
         canvas[
-            pad_top:pad_top + height,
+            pad_top:
+            pad_top + height,
             :,
             :
         ] = arr
@@ -401,14 +700,14 @@ def pad_to_target_ratio(img):
 
         if pad_top > 0:
 
-            top_fill = build_edge_fill(
+            fill = build_edge_fill(
                 top_strip,
                 pad_top,
                 axis="v",
             )
 
-            top_fill = add_matched_noise(
-                top_fill,
+            fill = add_matched_noise(
+                fill,
                 estimate_local_noise(
                     top_strip
                 ),
@@ -419,18 +718,18 @@ def pad_to_target_ratio(img):
                 :pad_top,
                 :,
                 :
-            ] = top_fill
+            ] = fill
 
         if pad_bottom > 0:
 
-            bottom_fill = build_edge_fill(
+            fill = build_edge_fill(
                 bottom_strip,
                 pad_bottom,
                 axis="v",
             )
 
-            bottom_fill = add_matched_noise(
-                bottom_fill,
+            fill = add_matched_noise(
+                fill,
                 estimate_local_noise(
                     bottom_strip
                 ),
@@ -441,18 +740,21 @@ def pad_to_target_ratio(img):
                 pad_top + height:,
                 :,
                 :
-            ] = bottom_fill
+            ] = fill
 
         seams = []
 
         if pad_top > 0:
+
             seams.append(
                 pad_top
             )
 
         if pad_bottom > 0:
+
             seams.append(
-                pad_top + height
+                pad_top
+                + height
             )
 
         vertical_padding = True
@@ -466,8 +768,7 @@ def pad_to_target_ratio(img):
     # ========================================================
     # IMAGE TOO TALL / NARROW
     #
-    # Need additional WIDTH.
-    # Add left + right padding.
+    # Add LEFT + RIGHT
     # ========================================================
 
     else:
@@ -475,19 +776,23 @@ def pad_to_target_ratio(img):
         new_height = height
 
         new_width = round(
-            height / TARGET_RATIO
+            height
+            / TARGET_RATIO
         )
 
         pad_total = (
-            new_width - width
+            new_width
+            - width
         )
 
         pad_left = (
-            pad_total // 2
+            pad_total
+            // 2
         )
 
         pad_right = (
-            pad_total - pad_left
+            pad_total
+            - pad_left
         )
 
         canvas = np.zeros(
@@ -499,10 +804,11 @@ def pad_to_target_ratio(img):
             dtype=np.float32,
         )
 
-        # Original image
+        # Original image remains untouched.
         canvas[
             :,
-            pad_left:pad_left + width,
+            pad_left:
+            pad_left + width,
             :
         ] = arr
 
@@ -525,14 +831,14 @@ def pad_to_target_ratio(img):
 
         if pad_left > 0:
 
-            left_fill = build_edge_fill(
+            fill = build_edge_fill(
                 left_strip,
                 pad_left,
                 axis="h",
             )
 
-            left_fill = add_matched_noise(
-                left_fill,
+            fill = add_matched_noise(
+                fill,
                 estimate_local_noise(
                     left_strip
                 ),
@@ -543,18 +849,18 @@ def pad_to_target_ratio(img):
                 :,
                 :pad_left,
                 :
-            ] = left_fill
+            ] = fill
 
         if pad_right > 0:
 
-            right_fill = build_edge_fill(
+            fill = build_edge_fill(
                 right_strip,
                 pad_right,
                 axis="h",
             )
 
-            right_fill = add_matched_noise(
-                right_fill,
+            fill = add_matched_noise(
+                fill,
                 estimate_local_noise(
                     right_strip
                 ),
@@ -565,18 +871,21 @@ def pad_to_target_ratio(img):
                 :,
                 pad_left + width:,
                 :
-            ] = right_fill
+            ] = fill
 
         seams = []
 
         if pad_left > 0:
+
             seams.append(
                 pad_left
             )
 
         if pad_right > 0:
+
             seams.append(
-                pad_left + width
+                pad_left
+                + width
             )
 
         vertical_padding = False
@@ -591,18 +900,23 @@ def pad_to_target_ratio(img):
     # CONVERT BACK TO PIL
     # ========================================================
 
-    output_image = Image.fromarray(
-        np.clip(
-            canvas,
-            0,
-            255,
-        ).astype(
-            np.uint8
+    output_image = (
+        Image.fromarray(
+            np.clip(
+                canvas,
+                0,
+                255,
+            ).astype(
+                np.uint8
+            )
         )
     )
 
     # ========================================================
-    # SOFTEN SEAMS
+    # SEAM BLENDING
+    #
+    # Safe because images touching boundaries were already
+    # excluded before reaching this function.
     # ========================================================
 
     for seam in seams:
@@ -613,12 +927,14 @@ def pad_to_target_ratio(img):
                 0,
                 max(
                     0,
-                    seam - SEAM_BLUR_BAND,
+                    seam
+                    - SEAM_BLUR_BAND,
                 ),
                 new_width,
                 min(
                     new_height,
-                    seam + SEAM_BLUR_BAND,
+                    seam
+                    + SEAM_BLUR_BAND,
                 ),
             )
 
@@ -627,18 +943,22 @@ def pad_to_target_ratio(img):
             box = (
                 max(
                     0,
-                    seam - SEAM_BLUR_BAND,
+                    seam
+                    - SEAM_BLUR_BAND,
                 ),
                 0,
                 min(
                     new_width,
-                    seam + SEAM_BLUR_BAND,
+                    seam
+                    + SEAM_BLUR_BAND,
                 ),
                 new_height,
             )
 
-        crop = output_image.crop(
-            box
+        crop = (
+            output_image.crop(
+                box
+            )
         )
 
         crop = crop.filter(
@@ -659,15 +979,86 @@ def pad_to_target_ratio(img):
 
 
 # ============================================================
+# SOURCE URL NORMALIZATION
+# ============================================================
+
+
+def normalize_source_url(url):
+    """
+    Convert Google Drive share URLs into direct-download URLs.
+
+    Other image URLs remain unchanged.
+    """
+
+    url = str(
+        url
+    ).strip()
+
+    # --------------------------------------------------------
+    # Example:
+    #
+    # drive.google.com/file/d/FILE_ID/view
+    # --------------------------------------------------------
+
+    drive_match = re.search(
+        r"drive\.google\.com/file/d/([^/?]+)",
+        url,
+        re.IGNORECASE,
+    )
+
+    if drive_match:
+
+        file_id = (
+            drive_match.group(1)
+        )
+
+        return (
+            "https://drive.usercontent.google.com/"
+            f"download?id={file_id}&export=download"
+        )
+
+    # --------------------------------------------------------
+    # Example:
+    #
+    # drive.google.com/open?id=FILE_ID
+    # --------------------------------------------------------
+
+    if "drive.google.com" in url:
+
+        id_match = re.search(
+            r"[?&]id=([^&]+)",
+            url,
+            re.IGNORECASE,
+        )
+
+        if id_match:
+
+            file_id = (
+                id_match.group(1)
+            )
+
+            return (
+                "https://drive.usercontent.google.com/"
+                f"download?id={file_id}&export=download"
+            )
+
+    return url
+
+
+# ============================================================
 # IMAGE DOWNLOAD
 # ============================================================
 
 
 def download_image(url):
     """
-    Download image with retries, redirects and timeout handling.
+    Download image with retries, redirect handling and size limit.
     """
-    url = normalize_source_url(url)
+
+    url = normalize_source_url(
+        url
+    )
+
     headers = {
         "User-Agent": (
             "Mozilla/5.0 "
@@ -714,6 +1105,7 @@ def download_image(url):
                 allow_redirects=True,
             ) as response:
 
+                # Temporary failures can be retried.
                 if response.status_code in (
                     429,
                     500,
@@ -722,9 +1114,14 @@ def download_image(url):
                     504,
                 ):
 
-                    raise requests.exceptions.HTTPError(
-                        f"HTTP {response.status_code}",
-                        response=response,
+                    raise (
+                        requests
+                        .exceptions
+                        .HTTPError(
+                            f"HTTP "
+                            f"{response.status_code}",
+                            response=response,
+                        )
                     )
 
                 response.raise_for_status()
@@ -733,7 +1130,7 @@ def download_image(url):
                     response.headers
                     .get(
                         "Content-Type",
-                        ""
+                        "",
                     )
                     .lower()
                 )
@@ -759,33 +1156,39 @@ def download_image(url):
                 if content_length:
 
                     try:
+
                         content_length_int = int(
                             content_length
                         )
 
-                        if (
-                            content_length_int
-                            > max_bytes
-                        ):
-                            raise ValueError(
-                                f"Image is larger than "
-                                f"{MAX_DOWNLOAD_MB} MB"
-                            )
+                    except (
+                        ValueError,
+                        TypeError,
+                    ):
 
-                    except ValueError as error:
+                        content_length_int = None
 
-                        if (
-                            "larger than"
-                            in str(error)
-                        ):
-                            raise
+                    if (
+                        content_length_int
+                        is not None
+                        and content_length_int
+                        > max_bytes
+                    ):
+
+                        raise ValueError(
+                            f"Image is larger than "
+                            f"{MAX_DOWNLOAD_MB} MB"
+                        )
 
                 buffer = BytesIO()
 
                 downloaded = 0
 
-                for chunk in response.iter_content(
-                    chunk_size=64 * 1024
+                for chunk in (
+                    response.iter_content(
+                        chunk_size=64
+                        * 1024
+                    )
                 ):
 
                     if not chunk:
@@ -806,13 +1209,15 @@ def download_image(url):
                         chunk
                     )
 
-            buffer.seek(0)
+            buffer.seek(
+                0
+            )
 
             image = Image.open(
                 buffer
             )
 
-            # Decode immediately.
+            # Decode while buffer still exists.
             image.load()
 
             return image
@@ -832,16 +1237,22 @@ def download_image(url):
                     error,
                     requests.exceptions.HTTPError,
                 )
-                and error.response is not None
+                and error.response
+                is not None
             ):
+
                 status_code = (
-                    error.response.status_code
+                    error
+                    .response
+                    .status_code
                 )
 
-            # Permanent HTTP failures should not be retried.
+            # Don't retry permanent HTTP errors such as 403/404.
             if (
-                status_code is not None
-                and status_code not in (
+                status_code
+                is not None
+                and status_code
+                not in (
                     429,
                     500,
                     502,
@@ -849,6 +1260,7 @@ def download_image(url):
                     504,
                 )
             ):
+
                 raise
 
             if attempt < DOWNLOAD_RETRIES:
@@ -857,17 +1269,23 @@ def download_image(url):
                     attempt
                 )
 
-    raise last_error
+    if last_error is not None:
+
+        raise last_error
+
+    raise RuntimeError(
+        "Image download failed."
+    )
 
 
 # ============================================================
-# HELPERS
+# GENERAL HELPERS
 # ============================================================
 
 
 def safe_filename(value):
     """
-    Convert Parent Group Id into a safe filesystem filename.
+    Convert Parent Group Id into filesystem-safe text.
     """
 
     value = str(
@@ -890,15 +1308,15 @@ def safe_filename(value):
         "._"
     )
 
-    if not value:
-        return "unknown"
-
-    return value
+    return (
+        value
+        or "unknown"
+    )
 
 
 def get_image_source(cell):
     """
-    Read URL from a normal Excel cell or Excel hyperlink.
+    Read URL from either normal Excel cell or hyperlink.
     """
 
     if cell.hyperlink:
@@ -908,21 +1326,23 @@ def get_image_source(cell):
         )
 
         if target:
+
             return str(
                 target
             ).strip()
 
     if cell.value is None:
+
         return None
 
     value = str(
         cell.value
     ).strip()
 
-    if not value:
-        return None
-
-    return value
+    return (
+        value
+        or None
+    )
 
 
 # ============================================================
@@ -935,7 +1355,7 @@ def find_header_column(
     expected_header,
 ):
     """
-    Find a header in row 1, case-insensitive.
+    Find header in row 1, case-insensitive.
     """
 
     expected = (
@@ -949,11 +1369,16 @@ def find_header_column(
         if cell.value is None:
             continue
 
-        actual = str(
-            cell.value
-        ).strip().lower()
+        actual = (
+            str(
+                cell.value
+            )
+            .strip()
+            .lower()
+        )
 
         if actual == expected:
+
             return cell.column
 
     return None
@@ -963,14 +1388,12 @@ def find_image_columns(
     worksheet,
 ):
     """
-    Detect:
+    Automatically detect:
 
         Image Url 1
         Image Url 2
         ...
         Image Url 8
-
-    Case-insensitive.
     """
 
     pattern = re.compile(
@@ -1001,8 +1424,11 @@ def find_image_columns(
         )
 
         if not (
-            1 <= position <= MAX_IMAGES_PER_SKU
+            1
+            <= position
+            <= MAX_IMAGES_PER_SKU
         ):
+
             continue
 
         image_columns.append(
@@ -1014,9 +1440,9 @@ def find_image_columns(
         )
 
     image_columns.sort(
-        key=lambda item: item[
-            "position"
-        ]
+        key=lambda item: (
+            item["position"]
+        )
     )
 
     return image_columns
@@ -1034,18 +1460,40 @@ def process_image(
     output_dir,
 ):
     """
-    Download, validate, transform and save one image.
+    Process one image.
+
+    Decision flow:
+
+        Download
+            ↓
+        Minimum resolution?
+            ↓
+        Product touches any edge?
+           YES → SKIP
+           NO
+            ↓
+        Ratio correct?
+           YES → save unchanged
+           NO  → transform + save
     """
 
     result = {
-        "parent_group_id": str(
-            parent_group_id
+        "parent_group_id": (
+            str(
+                parent_group_id
+            )
         ),
-        "image_position": image_position,
-        "source_url": source_url,
+        "image_position": (
+            image_position
+        ),
+        "source_url": (
+            source_url
+        ),
         "processing_status": "",
         "original_dimensions": "",
         "original_w_h_ratio": "",
+        "edge_warning": "",
+        "edge_detection_details": "",
         "output_dimensions": "",
         "output_w_h_ratio": "",
         "transformation": "",
@@ -1055,9 +1503,9 @@ def process_image(
 
     try:
 
-        # ----------------------------------------------------
+        # ====================================================
         # DOWNLOAD
-        # ----------------------------------------------------
+        # ====================================================
 
         image = download_image(
             source_url
@@ -1086,9 +1534,9 @@ def process_image(
             4,
         )
 
-        # ----------------------------------------------------
-        # MINIMUM RESOLUTION CHECK
-        # ----------------------------------------------------
+        # ====================================================
+        # MINIMUM RESOLUTION
+        # ====================================================
 
         if (
             original_width < MIN_W
@@ -1113,14 +1561,67 @@ def process_image(
 
             return result
 
-        # ----------------------------------------------------
-        # TRANSFORM
-        # ----------------------------------------------------
+        # ====================================================
+        # SELLER OPS RULE
+        #
+        # Product touches ANY boundary:
+        #
+        # DO NOT TRANSFORM
+        # DO NOT RE-ENCODE
+        # DO NOT CREATE OUTPUT IMAGE
+        # ====================================================
 
-        transformed, transformation = (
-            pad_to_target_ratio(
-                image
+        (
+            edge_warnings,
+            fractions,
+        ) = detect_product_touching_edges(
+            image
+        )
+
+        result[
+            "edge_detection_details"
+        ] = (
+            " | ".join(
+                f"{name}="
+                f"{fraction:.1%}"
+                for name, fraction
+                in fractions.items()
             )
+        )
+
+        if edge_warnings:
+
+            result[
+                "processing_status"
+            ] = (
+                "SKIPPED_PRODUCT_TOUCHES_EDGE"
+            )
+
+            result[
+                "edge_warning"
+            ] = (
+                "; ".join(
+                    edge_warnings
+                )
+            )
+
+            result[
+                "transformation"
+            ] = (
+                "SKIPPED"
+            )
+
+            return result
+
+        # ====================================================
+        # SAFE TO TRANSFORM
+        # ====================================================
+
+        (
+            transformed,
+            transformation,
+        ) = pad_to_target_ratio(
+            image
         )
 
         output_width, output_height = (
@@ -1144,23 +1645,29 @@ def process_image(
 
         result[
             "transformation"
-        ] = transformation
+        ] = (
+            transformation
+        )
 
-        # ----------------------------------------------------
-        # SAVE
+        # ====================================================
+        # OUTPUT FILE
         #
-        # SKU123_01.jpg
-        # SKU123_02.jpg
-        # ----------------------------------------------------
+        # No leading zero:
+        #
+        # SKU_1.jpg
+        # SKU_2.jpg
+        # ====================================================
 
         filename = (
             f"{safe_filename(parent_group_id)}_"
             f"{image_position}.jpg"
         )
 
-        output_path = os.path.join(
-            output_dir,
-            filename,
+        output_path = (
+            os.path.join(
+                output_dir,
+                filename,
+            )
         )
 
         transformed.save(
@@ -1174,6 +1681,10 @@ def process_image(
         result[
             "output_file"
         ] = filename
+
+        # ====================================================
+        # SUCCESS
+        # ====================================================
 
         if transformation == "NONE":
 
@@ -1192,6 +1703,10 @@ def process_image(
             )
 
         return result
+
+    # ========================================================
+    # ERRORS
+    # ========================================================
 
     except requests.exceptions.Timeout:
 
@@ -1213,10 +1728,15 @@ def process_image(
 
         status_code = ""
 
-        if error.response is not None:
+        if (
+            error.response
+            is not None
+        ):
 
             status_code = (
-                error.response.status_code
+                error
+                .response
+                .status_code
             )
 
         result[
@@ -1228,7 +1748,8 @@ def process_image(
         result[
             "processing_error"
         ] = (
-            f"HTTP {status_code}: "
+            f"HTTP "
+            f"{status_code}: "
             f"{error}"
         )
 
@@ -1244,8 +1765,10 @@ def process_image(
 
         result[
             "processing_error"
-        ] = str(
-            error
+        ] = (
+            str(
+                error
+            )
         )
 
         return result
@@ -1260,15 +1783,17 @@ def process_image(
 
         result[
             "processing_error"
-        ] = str(
-            error
+        ] = (
+            str(
+                error
+            )
         )
 
         return result
 
 
 # ============================================================
-# RESULTS SHEET
+# PROCESSING RESULTS SHEET
 # ============================================================
 
 
@@ -1280,6 +1805,8 @@ RESULT_HEADERS = [
     "Processing Status",
     "Original Dimensions",
     "Original W:H Ratio",
+    "Edge Warning",
+    "Edge Detection Details",
     "Output Dimensions",
     "Output W:H Ratio",
     "Transformation",
@@ -1292,24 +1819,30 @@ def prepare_results_sheet(
     workbook,
 ):
     """
-    Replace previous results sheet, if one exists.
+    Recreate Processing Results sheet.
     """
 
-    if RESULT_SHEET_NAME in workbook.sheetnames:
-
-        existing_sheet = workbook[
-            RESULT_SHEET_NAME
-        ]
+    if (
+        RESULT_SHEET_NAME
+        in workbook.sheetnames
+    ):
 
         workbook.remove(
-            existing_sheet
+            workbook[
+                RESULT_SHEET_NAME
+            ]
         )
 
-    worksheet = workbook.create_sheet(
-        RESULT_SHEET_NAME
+    worksheet = (
+        workbook.create_sheet(
+            RESULT_SHEET_NAME
+        )
     )
 
-    for column_index, header in enumerate(
+    for (
+        column_index,
+        header,
+    ) in enumerate(
         RESULT_HEADERS,
         start=1,
     ):
@@ -1330,11 +1863,15 @@ def prepare_results_sheet(
             fgColor="1F4E78",
         )
 
-        cell.alignment = Alignment(
-            vertical="center",
+        cell.alignment = (
+            Alignment(
+                vertical="center",
+            )
         )
 
-    worksheet.freeze_panes = "A2"
+    worksheet.freeze_panes = (
+        "A2"
+    )
 
     return worksheet
 
@@ -1345,7 +1882,7 @@ def write_result_row(
     result,
 ):
     """
-    Add one processing result to the results sheet.
+    Write one image processing result.
     """
 
     worksheet.append(
@@ -1370,6 +1907,12 @@ def write_result_row(
                 "original_w_h_ratio"
             ],
             result[
+                "edge_warning"
+            ],
+            result[
+                "edge_detection_details"
+            ],
+            result[
                 "output_dimensions"
             ],
             result[
@@ -1392,7 +1935,7 @@ def format_results_sheet(
     worksheet,
 ):
     """
-    Make the results sheet easier to review.
+    Format Processing Results sheet.
     """
 
     worksheet.auto_filter.ref = (
@@ -1403,18 +1946,23 @@ def format_results_sheet(
         1: 30,
         2: 15,
         3: 18,
-        4: 75,
-        5: 28,
+        4: 70,
+        5: 36,
         6: 22,
         7: 20,
-        8: 22,
-        9: 20,
-        10: 42,
-        11: 42,
-        12: 60,
+        8: 45,
+        9: 55,
+        10: 22,
+        11: 20,
+        12: 42,
+        13: 42,
+        14: 65,
     }
 
-    for column_index, width in widths.items():
+    for (
+        column_index,
+        width,
+    ) in widths.items():
 
         worksheet.column_dimensions[
             get_column_letter(
@@ -1422,34 +1970,43 @@ def format_results_sheet(
             )
         ].width = width
 
-    success_fill = PatternFill(
-        fill_type="solid",
-        fgColor="E2F0D9",
+    success_fill = (
+        PatternFill(
+            fill_type="solid",
+            fgColor="E2F0D9",
+        )
     )
 
-    warning_fill = PatternFill(
-        fill_type="solid",
-        fgColor="FCE5CD",
+    warning_fill = (
+        PatternFill(
+            fill_type="solid",
+            fgColor="FCE5CD",
+        )
     )
 
-    error_fill = PatternFill(
-        fill_type="solid",
-        fgColor="F4CCCC",
+    error_fill = (
+        PatternFill(
+            fill_type="solid",
+            fgColor="F4CCCC",
+        )
     )
 
-    # Processing Status = column 5
     for row_index in range(
         2,
-        worksheet.max_row + 1,
+        worksheet.max_row
+        + 1,
     ):
 
-        status_cell = worksheet.cell(
-            row=row_index,
-            column=5,
+        status_cell = (
+            worksheet.cell(
+                row=row_index,
+                column=5,
+            )
         )
 
         status = str(
-            status_cell.value or ""
+            status_cell.value
+            or ""
         )
 
         if status.startswith(
@@ -1460,8 +2017,13 @@ def format_results_sheet(
                 success_fill
             )
 
-        elif status.startswith(
-            "BLOCKED"
+        elif (
+            status.startswith(
+                "BLOCKED"
+            )
+            or status.startswith(
+                "SKIPPED"
+            )
         ):
 
             status_cell.fill = (
@@ -1491,61 +2053,48 @@ def process_excel(
     progress_callback=None,
 ):
     """
-    Process complete Excel catalogue.
-
-    progress_callback, when supplied, receives:
-
-        progress_callback(
-            completed,
-            total,
-            parent_group_id,
-            image_position,
-            status,
-        )
-
-    Status will first be:
-
-        PROCESSING
-
-    and then:
-
-        SUCCESS_TRANSFORMED
-        SUCCESS_NO_CHANGE
-        BLOCKED_MIN_RESOLUTION
-        ERROR_HTTP
-        etc.
-
-    Returns a summary dictionary.
+    Process complete catalogue workbook.
     """
 
     workbook = load_workbook(
         input_path
     )
 
-    # --------------------------------------------------------
-    # INPUT WORKSHEET
-    # --------------------------------------------------------
+    # ========================================================
+    # INPUT SHEET
+    # ========================================================
 
     if sheet_name:
 
-        if sheet_name not in workbook.sheetnames:
+        if (
+            sheet_name
+            not in workbook.sheetnames
+        ):
 
             raise ValueError(
-                f"Sheet '{sheet_name}' not found. "
+                f"Sheet "
+                f"'{sheet_name}' "
+                f"not found. "
                 f"Available sheets: "
                 f"{workbook.sheetnames}"
             )
 
-        worksheet = workbook[
-            sheet_name
-        ]
+        worksheet = (
+            workbook[
+                sheet_name
+            ]
+        )
 
     else:
 
         possible_sheets = [
             sheet
-            for sheet in workbook.worksheets
-            if sheet.title != RESULT_SHEET_NAME
+            for sheet
+            in workbook.worksheets
+            if (
+                sheet.title
+                != RESULT_SHEET_NAME
+            )
         ]
 
         if not possible_sheets:
@@ -1554,25 +2103,40 @@ def process_excel(
                 "No input worksheet found."
             )
 
-        worksheet = possible_sheets[
-            0
-        ]
+        worksheet = (
+            possible_sheets[0]
+        )
 
-    # --------------------------------------------------------
-    # PARENT GROUP ID COLUMN
-    # --------------------------------------------------------
-
-    sku_column_index = find_header_column(
-        worksheet,
-        sku_column,
+    input_sheet_title = (
+        worksheet.title
     )
 
-    if sku_column_index is None:
+    # ========================================================
+    # FIND SKU COLUMN
+    # ========================================================
+
+    sku_column_index = (
+        find_header_column(
+            worksheet,
+            sku_column,
+        )
+    )
+
+    if (
+        sku_column_index
+        is None
+    ):
 
         headers = [
-            str(cell.value)
-            for cell in worksheet[1]
-            if cell.value is not None
+            str(
+                cell.value
+            )
+            for cell
+            in worksheet[1]
+            if (
+                cell.value
+                is not None
+            )
         ]
 
         raise ValueError(
@@ -1582,82 +2146,97 @@ def process_excel(
             f"{headers}"
         )
 
-    # --------------------------------------------------------
-    # IMAGE URL COLUMNS
-    # --------------------------------------------------------
+    # ========================================================
+    # FIND IMAGE URL COLUMNS
+    # ========================================================
 
-    image_columns = find_image_columns(
-        worksheet
+    image_columns = (
+        find_image_columns(
+            worksheet
+        )
     )
 
     if not image_columns:
 
         raise ValueError(
             "No image columns found. "
-            "Expected 'Image Url 1', "
+            "Expected "
+            "'Image Url 1', "
             "'Image Url 2', etc."
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # OUTPUT
-    # --------------------------------------------------------
+    # ========================================================
 
     os.makedirs(
         output_dir,
         exist_ok=True,
     )
 
-    results_sheet = prepare_results_sheet(
-        workbook
+    results_sheet = (
+        prepare_results_sheet(
+            workbook
+        )
     )
 
-    # --------------------------------------------------------
-    # COUNT TOTAL IMAGES
-    # --------------------------------------------------------
+    # ========================================================
+    # COUNT IMAGES
+    # ========================================================
 
     total_images = 0
 
     for row_index in range(
         2,
-        worksheet.max_row + 1,
+        worksheet.max_row
+        + 1,
     ):
 
-        parent_group_id = worksheet.cell(
-            row=row_index,
-            column=sku_column_index,
-        ).value
+        parent_group_id = (
+            worksheet.cell(
+                row=row_index,
+                column=sku_column_index,
+            ).value
+        )
 
         if (
-            parent_group_id is None
+            parent_group_id
+            is None
             or not str(
                 parent_group_id
             ).strip()
         ):
+
             continue
 
         for item in image_columns:
 
-            image_cell = worksheet.cell(
-                row=row_index,
-                column=item[
-                    "column"
-                ],
+            image_cell = (
+                worksheet.cell(
+                    row=row_index,
+                    column=item[
+                        "column"
+                    ],
+                )
             )
 
             if get_image_source(
                 image_cell
             ):
+
                 total_images += 1
 
     if total_images == 0:
 
         raise ValueError(
-            "No image URLs were found in the workbook."
+            "No image URLs were found."
         )
 
     print()
+
     print(
-        f"Sheet: {worksheet.title}"
+        f"Sheet: "
+        f"{input_sheet_title}"
     )
 
     print(
@@ -1666,7 +2245,7 @@ def process_excel(
     )
 
     print(
-        f"Minimum: "
+        f"Minimum resolution: "
         f"{MIN_W}x{MIN_H}"
     )
 
@@ -1675,57 +2254,77 @@ def process_excel(
         f"{TARGET_W_H_RATIO:.6f}"
     )
 
+    print(
+        "Edge rule: "
+        "skip image if product "
+        "touches any boundary"
+    )
+
     print()
 
-    # --------------------------------------------------------
-    # PROCESS IMAGES
-    # --------------------------------------------------------
+    # ========================================================
+    # PROCESS
+    # ========================================================
 
-    status_counts = Counter()
+    status_counts = (
+        Counter()
+    )
 
     processed_count = 0
 
     for row_index in range(
         2,
-        worksheet.max_row + 1,
+        worksheet.max_row
+        + 1,
     ):
 
-        parent_group_id = worksheet.cell(
-            row=row_index,
-            column=sku_column_index,
-        ).value
+        parent_group_id = (
+            worksheet.cell(
+                row=row_index,
+                column=sku_column_index,
+            ).value
+        )
 
         if (
-            parent_group_id is None
+            parent_group_id
+            is None
             or not str(
                 parent_group_id
             ).strip()
         ):
+
             continue
 
-        parent_group_id = str(
-            parent_group_id
-        ).strip()
+        parent_group_id = (
+            str(
+                parent_group_id
+            ).strip()
+        )
 
         for item in image_columns:
 
-            image_cell = worksheet.cell(
-                row=row_index,
-                column=item[
-                    "column"
-                ],
+            image_cell = (
+                worksheet.cell(
+                    row=row_index,
+                    column=item[
+                        "column"
+                    ],
+                )
             )
 
-            source_url = get_image_source(
-                image_cell
+            source_url = (
+                get_image_source(
+                    image_cell
+                )
             )
 
             if not source_url:
+
                 continue
 
-            # ----------------------------------------------
-            # TELL STREAMLIT WE ARE STARTING THIS IMAGE
-            # ----------------------------------------------
+            # ------------------------------------------------
+            # STREAMLIT PROGRESS - STARTING
+            # ------------------------------------------------
 
             if progress_callback:
 
@@ -1739,17 +2338,21 @@ def process_excel(
                     "PROCESSING",
                 )
 
-            # ----------------------------------------------
+            # ------------------------------------------------
             # PROCESS IMAGE
-            # ----------------------------------------------
+            # ------------------------------------------------
 
             result = process_image(
                 source_url=source_url,
-                parent_group_id=parent_group_id,
+                parent_group_id=(
+                    parent_group_id
+                ),
                 image_position=item[
                     "position"
                 ],
-                output_dir=output_dir,
+                output_dir=(
+                    output_dir
+                ),
             )
 
             processed_count += 1
@@ -1762,21 +2365,23 @@ def process_excel(
                 status
             ] += 1
 
-            # ----------------------------------------------
-            # WRITE RESULT
-            # ----------------------------------------------
+            # ------------------------------------------------
+            # WRITE REPORT
+            # ------------------------------------------------
 
             write_result_row(
-                worksheet=results_sheet,
+                worksheet=(
+                    results_sheet
+                ),
                 source_column=item[
                     "header"
                 ],
                 result=result,
             )
 
-            # ----------------------------------------------
-            # UPDATE STREAMLIT AFTER IMAGE COMPLETES
-            # ----------------------------------------------
+            # ------------------------------------------------
+            # STREAMLIT PROGRESS - COMPLETE
+            # ------------------------------------------------
 
             if progress_callback:
 
@@ -1802,9 +2407,18 @@ def process_excel(
                 f"| {status}"
             )
 
-    # --------------------------------------------------------
+            if result[
+                "edge_warning"
+            ]:
+
+                print(
+                    f"    -> "
+                    f"{result['edge_warning']}"
+                )
+
+    # ========================================================
     # SAVE REPORT
-    # --------------------------------------------------------
+    # ========================================================
 
     format_results_sheet(
         results_sheet
@@ -1816,9 +2430,9 @@ def process_excel(
 
     workbook.close()
 
-    # --------------------------------------------------------
+    # ========================================================
     # SUMMARY
-    # --------------------------------------------------------
+    # ========================================================
 
     successful = sum(
         count
@@ -1829,19 +2443,32 @@ def process_excel(
         )
     )
 
-    transformed = status_counts.get(
-        "SUCCESS_TRANSFORMED",
-        0,
+    transformed = (
+        status_counts.get(
+            "SUCCESS_TRANSFORMED",
+            0,
+        )
     )
 
-    unchanged = status_counts.get(
-        "SUCCESS_NO_CHANGE",
-        0,
+    unchanged = (
+        status_counts.get(
+            "SUCCESS_NO_CHANGE",
+            0,
+        )
     )
 
-    blocked = status_counts.get(
-        "BLOCKED_MIN_RESOLUTION",
-        0,
+    skipped = (
+        status_counts.get(
+            "SKIPPED_PRODUCT_TOUCHES_EDGE",
+            0,
+        )
+    )
+
+    blocked = (
+        status_counts.get(
+            "BLOCKED_MIN_RESOLUTION",
+            0,
+        )
     )
 
     errors = sum(
@@ -1854,25 +2481,45 @@ def process_excel(
     )
 
     return {
-        "total": processed_count,
-        "successful": successful,
-        "transformed": transformed,
-        "unchanged": unchanged,
-        "blocked": blocked,
-        "errors": errors,
+        "total": (
+            processed_count
+        ),
+        "successful": (
+            successful
+        ),
+        "transformed": (
+            transformed
+        ),
+        "unchanged": (
+            unchanged
+        ),
+        "skipped": (
+            skipped
+        ),
+        "blocked": (
+            blocked
+        ),
+        "errors": (
+            errors
+        ),
         "statuses": dict(
             status_counts
         ),
         "image_columns": [
-            item["header"]
-            for item in image_columns
+            item[
+                "header"
+            ]
+            for item
+            in image_columns
         ],
-        "input_sheet": worksheet.title,
+        "input_sheet": (
+            input_sheet_title
+        ),
     }
 
 
 # ============================================================
-# COMMAND LINE SUPPORT
+# COMMAND LINE
 # ============================================================
 
 
@@ -1880,36 +2527,45 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Process product images from an "
-            "Excel catalogue containing "
-            "Parent Group Id + Image Url 1..8."
+            "Validate and transform "
+            "product images from "
+            "Parent Group Id + "
+            "Image Url 1..8."
         )
     )
 
     parser.add_argument(
         "input",
-        help="Input .xlsx file",
+        help=(
+            "Input .xlsx catalogue"
+        ),
     )
 
     parser.add_argument(
         "output",
         help=(
-            "Folder for processed images"
+            "Directory for "
+            "transformed images"
         ),
     )
 
     parser.add_argument(
         "--sheet",
         default=None,
-        help="Excel sheet name",
+        help=(
+            "Optional Excel "
+            "sheet name"
+        ),
     )
 
     parser.add_argument(
         "--sku-column",
-        default=DEFAULT_SKU_COLUMN,
+        default=(
+            DEFAULT_SKU_COLUMN
+        ),
         help=(
-            "SKU column. "
-            "Default: Parent Group Id"
+            "Default: "
+            "Parent Group Id"
         ),
     )
 
@@ -1917,18 +2573,23 @@ def main():
         "--report",
         default=None,
         help=(
-            "Output report path"
+            "Optional output "
+            "report path"
         ),
     )
 
     args = parser.parse_args()
 
-    input_path = os.path.abspath(
-        args.input
+    input_path = (
+        os.path.abspath(
+            args.input
+        )
     )
 
-    output_dir = os.path.abspath(
-        args.output
+    output_dir = (
+        os.path.abspath(
+            args.output
+        )
     )
 
     if not os.path.isfile(
@@ -1940,12 +2601,17 @@ def main():
             f"{input_path}"
         )
 
-    if not input_path.lower().endswith(
-        ".xlsx"
+    if not (
+        input_path
+        .lower()
+        .endswith(
+            ".xlsx"
+        )
     ):
 
         raise ValueError(
-            "Input must be an .xlsx file."
+            "Input must be "
+            "an .xlsx file."
         )
 
     os.makedirs(
@@ -1955,32 +2621,51 @@ def main():
 
     if args.report:
 
-        report_path = os.path.abspath(
-            args.report
+        report_path = (
+            os.path.abspath(
+                args.report
+            )
         )
 
     else:
 
-        report_path = os.path.join(
-            output_dir,
-            "processing_report.xlsx",
+        report_path = (
+            os.path.join(
+                output_dir,
+                "processing_report.xlsx",
+            )
         )
 
-    summary = process_excel(
-        input_path=input_path,
-        output_dir=output_dir,
-        report_path=report_path,
-        sku_column=args.sku_column,
-        sheet_name=args.sheet,
+    summary = (
+        process_excel(
+            input_path=(
+                input_path
+            ),
+            output_dir=(
+                output_dir
+            ),
+            report_path=(
+                report_path
+            ),
+            sku_column=(
+                args.sku_column
+            ),
+            sheet_name=(
+                args.sheet
+            ),
+        )
     )
 
     print()
+
     print(
         "=" * 60
     )
+
     print(
         "PROCESSING COMPLETE"
     )
+
     print(
         "=" * 60
     )
@@ -2006,7 +2691,14 @@ def main():
     )
 
     print(
-        f"Blocked: "
+        "Skipped - product "
+        "touches edge: "
+        f"{summary['skipped']}"
+    )
+
+    print(
+        "Blocked - minimum "
+        "resolution: "
         f"{summary['blocked']}"
     )
 
@@ -2016,6 +2708,7 @@ def main():
     )
 
     print()
+
     print(
         f"Report: "
         f"{report_path}"
@@ -2040,8 +2733,11 @@ if __name__ == "__main__":
 
     except Exception as error:
 
+        print()
+
         print(
-            f"\nERROR: {error}"
+            f"ERROR: "
+            f"{error}"
         )
 
         sys.exit(
