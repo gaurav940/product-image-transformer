@@ -1155,7 +1155,7 @@ def process_image(
 
         filename = (
             f"{safe_filename(parent_group_id)}_"
-            f"{image_position:02d}.jpg"
+            f"{image_position}.jpg"
         )
 
         output_path = os.path.join(
